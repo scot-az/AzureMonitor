@@ -1,0 +1,266 @@
+// Parameters
+param location string = resourceGroup().location
+param logAnalyticsWorkspaceName string
+param actionGroupNamePrefix string = 'ag-events'
+param alertRuleNamePrefix string = 'alert-event'
+
+// Webhook URLs - replace with your actual webhook endpoints
+param p2WebhookUrl string
+param p3WebhookUrl string
+
+// Business hours configuration (24-hour format)
+param businessHoursStart int = 8  // 8 AM
+param businessHoursEnd int = 17   // 5 PM
+param timeZone string = 'Eastern Standard Time'
+
+// Event IDs to monitor
+param eventIds array = [
+  1014
+  6008
+  // Add other event IDs here as needed
+]
+
+// Reference existing Log Analytics workspace
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
+  name: logAnalyticsWorkspaceName
+}
+
+// Action Group for P2 Webhook (After hours + Event 1014)
+resource actionGroupP2 'Microsoft.Insights/actionGroups@2023-01-01' = {
+  name: '${actionGroupNamePrefix}-p2'
+  location: 'Global'
+  properties: {
+    groupShortName: 'P2-Webhook'
+    enabled: true
+    webhookReceivers: [
+      {
+        name: 'P2-Webhook'
+        serviceUri: p2WebhookUrl
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+// Action Group for P3 Webhook (Business hours + Event 6008)
+resource actionGroupP3 'Microsoft.Insights/actionGroups@2023-01-01' = {
+  name: '${actionGroupNamePrefix}-p3'
+  location: 'Global'
+  properties: {
+    groupShortName: 'P3-Webhook'
+    enabled: true
+    webhookReceivers: [
+      {
+        name: 'P3-Webhook'
+        serviceUri: p3WebhookUrl
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+// Alert Rule for Event ID 1014 (Always P2 webhook)
+resource alertRule1014 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: '${alertRuleNamePrefix}-1014'
+  location: location
+  properties: {
+    displayName: 'Event ID 1014 Alert'
+    description: 'Alert for Event ID 1014 - Always triggers P2 webhook'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT5M'  // Check every 5 minutes
+    windowSize: 'PT5M'           // Look back 5 minutes
+    targetResourceTypes: [
+      'Microsoft.OperationalInsights/workspaces'
+    ]
+    scopes: [
+      logAnalyticsWorkspace.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            Event
+            | where EventID == 1014
+            | where TimeGenerated > ago(5m)
+            | project TimeGenerated, Computer, EventID, EventLevelName, RenderedDescription
+          '''
+          timeAggregation: 'Count'
+          dimensions: []
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        actionGroupP2.id
+      ]
+      customProperties: {}
+    }
+    autoMitigate: true
+    muteActionsDuration: 'PT30M'  // Suppress alerts for 30 minutes after first alert
+  }
+}
+
+// Alert Rule for Event ID 6008 during business hours (P3 webhook)
+resource alertRule6008BusinessHours 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: '${alertRuleNamePrefix}-6008-business-hours'
+  location: location
+  properties: {
+    displayName: 'Event ID 6008 Alert - Business Hours'
+    description: 'Alert for Event ID 6008 during business hours - triggers P3 webhook'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    targetResourceTypes: [
+      'Microsoft.OperationalInsights/workspaces'
+    ]
+    scopes: [
+      logAnalyticsWorkspace.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            Event
+            | where EventID == 6008
+            | where TimeGenerated > ago(5m)
+            | extend HourOfDay = hourofday(TimeGenerated)
+            | extend DayOfWeek = dayofweek(TimeGenerated)
+            | where HourOfDay >= ${businessHoursStart} and HourOfDay < ${businessHoursEnd}
+            | where DayOfWeek >= 1 and DayOfWeek <= 5  // Monday to Friday (1=Monday, 7=Sunday)
+            | project TimeGenerated, Computer, EventID, EventLevelName, RenderedDescription, HourOfDay, DayOfWeek
+          '''
+          timeAggregation: 'Count'
+          dimensions: []
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        actionGroupP3.id
+      ]
+      customProperties: {}
+    }
+    autoMitigate: true
+    muteActionsDuration: 'PT30M'  // Suppress alerts for 30 minutes after first alert
+  }
+}
+
+// Alert Rule for Event ID 6008 after hours (P2 webhook)
+resource alertRule6008AfterHours 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: '${alertRuleNamePrefix}-6008-after-hours'
+  location: location
+  properties: {
+    displayName: 'Event ID 6008 Alert - After Hours'
+    description: 'Alert for Event ID 6008 after business hours - triggers P2 webhook'
+    severity: 1  // Higher severity for after-hours
+    enabled: true
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    targetResourceTypes: [
+      'Microsoft.OperationalInsights/workspaces'
+    ]
+    scopes: [
+      logAnalyticsWorkspace.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            Event
+            | where EventID == 6008
+            | where TimeGenerated > ago(5m)
+            | extend HourOfDay = hourofday(TimeGenerated)
+            | extend DayOfWeek = dayofweek(TimeGenerated)
+            | where (HourOfDay < ${businessHoursStart} or HourOfDay >= ${businessHoursEnd}) or (DayOfWeek == 0 or DayOfWeek == 6)  // Outside business hours or weekends
+            | project TimeGenerated, Computer, EventID, EventLevelName, RenderedDescription, HourOfDay, DayOfWeek
+          '''
+          timeAggregation: 'Count'
+          dimensions: []
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        actionGroupP2.id
+      ]
+      customProperties: {}
+    }
+    autoMitigate: true
+    muteActionsDuration: 'PT30M'  // Suppress alerts for 30 minutes after first alert
+  }
+}
+
+// Generic alert rule template for other event IDs (customize as needed)
+resource alertRuleGeneric 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = [for eventId in eventIds: if(eventId != 1014 && eventId != 6008) {
+  name: '${alertRuleNamePrefix}-${eventId}'
+  location: location
+  properties: {
+    displayName: 'Event ID ${eventId} Alert'
+    description: 'Alert for Event ID ${eventId}'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    targetResourceTypes: [
+      'Microsoft.OperationalInsights/workspaces'
+    ]
+    scopes: [
+      logAnalyticsWorkspace.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            Event
+            | where EventID == ${eventId}
+            | where TimeGenerated > ago(5m)
+            | project TimeGenerated, Computer, EventID, EventLevelName, RenderedDescription
+          '''
+          timeAggregation: 'Count'
+          dimensions: []
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        actionGroupP2.id  // Default to P2 for other events, customize as needed
+      ]
+      customProperties: {}
+    }
+    autoMitigate: true
+    muteActionsDuration: 'PT30M'  // Suppress alerts for 30 minutes after first alert
+  }
+}]
+
+// Outputs
+output actionGroupP2Id string = actionGroupP2.id
+output actionGroupP3Id string = actionGroupP3.id
+output alertRule1014Id string = alertRule1014.id
+output alertRule6008BusinessHoursId string = alertRule6008BusinessHours.id
+output alertRule6008AfterHoursId string = alertRule6008AfterHours.id
